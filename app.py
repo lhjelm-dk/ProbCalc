@@ -48,8 +48,8 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
-st.set_page_config(page_title="ProbCalc", layout="wide")
-st.title("ProbCalc – Custom Monte Carlo simulation")
+st.set_page_config(page_title="ProbCalcMC", layout="wide")
+st.title("ProbCalcMC – Custom Monte Carlo simulation")
 st.markdown("<div style='margin-top:-0.5rem; font-size:0.9rem; color:#666'><em>by Lars Hjelm</em></div>", unsafe_allow_html=True)
 # Enlarge primary buttons slightly
 st.markdown("""
@@ -1427,7 +1427,7 @@ if compute_now and st.session_state.formulas:
             st.download_button(
                 "Download samples as CSV",
                 data=trial_df.to_csv(index=False).encode("utf-8"),
-                file_name="probcalc_samples.csv",
+                file_name="probcalcmc_samples.csv",
                 mime="text/csv"
             )
         with col2:
@@ -1518,7 +1518,7 @@ if compute_now and st.session_state.formulas:
                 st.download_button(
                     "Download as Excel",
                     data=output.getvalue(),
-                    file_name="probcalc_results.xlsx",
+                    file_name="probcalcmc_results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
