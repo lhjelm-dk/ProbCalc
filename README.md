@@ -39,12 +39,8 @@ Formula 2: margin = f1 / max(revenue, 1e-9)
 Formula 3: kpi    = res_profit / res_margin
 ```
 
-### Deploy on Streamlit Cloud
-
-1. Push the folder to GitHub.
-2. Go to https://share.streamlit.io and create a new app.
-3. Select the repo, set **Main file path** to `app.py`, click **Deploy**.
 
 ### License
 
 MIT (see LICENSE)
+
