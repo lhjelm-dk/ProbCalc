@@ -4,152 +4,13 @@ import pandas as pd
 import numexpr as ne
 import plotly.graph_objects as go
 from scipy import stats
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List
 import io
 import re
 import unicodedata
-import itertools
 import seaborn as sns
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-from matplotlib.axes import Axes
-from matplotlib.patches import Patch
-from matplotlib import cm
 import plotly.express as px
-from pathlib import Path
-import matplotlib.colors as mcolors
-
-SIMDEC_QUALITATIVE_CMAPS = [
-    "SimDec native (default)",
-    "SimDec sunset",
-    "SimDec ocean",
-    "SimDec pastel",
-    "Seaborn deep",
-    "tab20c",
-    "tab20",
-    "tab10",
-    "Accent",
-    "Dark2",
-    "Paired",
-    "Pastel1",
-    "Pastel2",
-    "Set1",
-    "Set2",
-    "Set3",
-    "Qualitative10",
-    "Spectral",
-    "viridis",
-    "plasma",
-    "magma",
-    "cividis",
-]
-
-CUSTOM_SIMDEC_PALETTES = {
-    "SimDec sunset": [
-        "#2C3E50",
-        "#E74C3C",
-        "#F39C12",
-        "#27AE60",
-        "#9B59B6",
-        "#16A085",
-    ],
-    "SimDec ocean": [
-        "#003f5c",
-        "#2f4b7c",
-        "#665191",
-        "#a05195",
-        "#d45087",
-        "#f95d6a",
-        "#ff7c43",
-        "#ffa600",
-    ],
-    "SimDec pastel": [
-        "#8dd3c7",
-        "#ffffb3",
-        "#bebada",
-        "#fb8072",
-        "#80b1d3",
-        "#fdb462",
-        "#b3de69",
-        "#fccde5",
-        "#d9d9d9",
-        "#bc80bd",
-    ],
-}
-
-# v0.8 (Nov 2025)
-# - Default distributions (A,B uniform 2–20; C beta 2,5 scaled to 40)
-# - Changed formula to A * (B + C)
-# - Integrated SimDec decomposition + visualization
-
-APP_VERSION = "v0.8"
-
-# Optional SimDec imports
-SIMDEC_AVAILABLE = False
-try:
-    from simdec import decompose, plot_bins, plot_box
-    SIMDEC_AVAILABLE = True
-except Exception:
-    try:
-        import simdec as _simdec
-
-        def decompose(df: pd.DataFrame, *, inputs, output, bins=10, states=None):
-            inputs_df = df[inputs]
-            output_series = df[output]
-            si_result = _simdec.sensitivity_indices(inputs_df, output_series)
-            return _simdec.decomposition(
-                inputs=inputs_df,
-                output=output_series,
-                sensitivity_indices=si_result.si,
-                dec_limit=1,
-                auto_ordering=True,
-                states=states,
-                statistic="mean",
-            )
-
-        def plot_bins(result):
-            fig, ax = plt.subplots(figsize=(10, 5))
-            palette_name = getattr(result, "palette_name", "SimDec native (default)")
-            palette_colors = _get_simdec_palette(result.states, palette_name)
-            if palette_colors is None:
-                palette_colors = _simdec.palette(result.states)
-            _simdec.visualization(
-                bins=result.bins,
-                palette=palette_colors,
-                ax=ax,
-                kind="histogram",
-                n_bins="auto",
-            )
-            ax.set_xlabel("Result")
-            ax.set_ylabel("Probability")
-            ax.set_title("Scenario Histogram")
-            if palette_name != "SimDec native (default)":
-                _apply_palette_to_figure(fig, palette_colors)
-            _style_simdec_plot(fig)
-            return fig
-
-        def plot_box(result):
-            fig, ax = plt.subplots(figsize=(10, 5))
-            palette_name = getattr(result, "palette_name", "SimDec native (default)")
-            palette_colors = _get_simdec_palette(result.states, palette_name)
-            if palette_colors is None:
-                palette_colors = _simdec.palette(result.states)
-            _simdec.visualization(
-                bins=result.bins,
-                palette=palette_colors,
-                ax=ax,
-                kind="boxplot",
-            )
-            ax.set_xlabel("Result")
-            ax.set_title("Scenario Box Plot")
-            if palette_name != "SimDec native (default)":
-                _apply_palette_to_figure(fig, palette_colors)
-            _style_simdec_plot(fig)
-            return fig
-
-        SIMDEC_AVAILABLE = True
-    except Exception:
-        SIMDEC_AVAILABLE = False
 
 # Optional SciPy imports
 try:
@@ -169,293 +30,6 @@ def approx_mode(x, bins=100):
     i = np.argmax(counts)
     return 0.5 * (edges[i] + edges[i + 1])
 
-
-def _extract_matplotlib_figure(plot_obj) -> Optional[Figure]:
-    """Best-effort extraction of a Matplotlib Figure from common plot objects."""
-    if isinstance(plot_obj, Figure):
-        return plot_obj
-    if isinstance(plot_obj, Axes):
-        return plot_obj.figure
-    if isinstance(plot_obj, tuple):
-        for item in plot_obj:
-            fig = _extract_matplotlib_figure(item)
-            if fig is not None:
-                return fig
-        return None
-    figure_attr = getattr(plot_obj, "figure", None)
-    if isinstance(figure_attr, Figure):
-        return figure_attr
-    return None
-
-
-def _display_simdec_plot(plot_obj):
-    """Render SimDec plot output (Matplotlib or Plotly) inside Streamlit."""
-    if plot_obj is None:
-        return
-    if isinstance(plot_obj, go.Figure):
-        st.plotly_chart(plot_obj, use_container_width=True)
-        return
-
-    fig = _extract_matplotlib_figure(plot_obj)
-    if fig is not None:
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-        return
-
-    # Fallback: display object as-is
-    st.write(plot_obj)
-
-
-def _get_simdec_palette(states, palette_name: str = "SimDec native (default)") -> Optional[List[List[float]]]:
-    """Return RGBA colours for the requested SimDec states using matplotlib palettes."""
-    if palette_name in (None, "SimDec native (default)"):
-        return None
-
-    if palette_name in CUSTOM_SIMDEC_PALETTES:
-        colors = CUSTOM_SIMDEC_PALETTES[palette_name]
-        colors_rgba = [mcolors.to_rgba(color) for color in colors]
-        total_states = 1
-        for entry in states:
-            if isinstance(entry, list):
-                total_states *= max(len(entry), 1)
-            elif isinstance(entry, int):
-                total_states *= max(entry, 1)
-        total_states = max(total_states, 1)
-        cycled = [colors_rgba[i % len(colors_rgba)] for i in range(total_states)]
-        return [(*color[:3], float(color[3]) if len(color) == 4 else 1.0) for color in cycled]
-
-    def _total_states() -> int:
-        total = 1
-        for entry in states:
-            if isinstance(entry, list):
-                total *= max(len(entry), 1)
-            elif isinstance(entry, int):
-                total *= max(entry, 1)
-            else:
-                total *= 1
-        return max(total, 1)
-
-    total_states = _total_states()
-
-    if palette_name == "Seaborn deep":
-        seaborn_palette = sns.color_palette("deep", total_states)
-        return [(*color, 1.0) for color in seaborn_palette]
-
-    try:
-        cmap = cm.get_cmap(palette_name, total_states)
-        palette = [tuple(cmap(i)) for i in range(total_states)]
-        return [(*color[:3], float(color[3]) if len(color) == 4 else 1.0) for color in palette]
-    except ValueError:
-        seaborn_palette = sns.color_palette("deep", total_states)
-        return [(*color, 1.0) for color in seaborn_palette]
-
-
-def _compute_state_thresholds(edges: np.ndarray, num_states: int) -> List[float]:
-    """Compute percentile cut points used to describe numeric ranges."""
-    percentiles = np.linspace(0, 100, num_states + 1)
-    return np.percentile(edges, percentiles)
-
-
-def _format_state_labels(result: Any) -> List[List[str]]:
-    """Produce scenario labels based on the user's selected style."""
-    var_names = getattr(result, "var_names", None)
-    states = getattr(result, "states", None)
-    bins = getattr(result, "bins", None)
-    if not var_names or not states or bins is None:
-        return []
-
-    state_labels: List[List[str]] = []
-    label_strategy = getattr(result, "label_strategy", "Percentile ranges")
-
-    for idx, (var_name, state) in enumerate(zip(var_names, states)):
-        if isinstance(state, list):
-            state_labels.append([str(item) for item in state])
-            continue
-
-        num_states = int(state)
-        edges = np.asarray(result.bin_edges[idx], dtype=float)
-        thresholds = _compute_state_thresholds(edges, num_states)
-
-        if label_strategy == "Low / Medium / High":
-            if num_states == 2:
-                labels = ["Low", "High"]
-            elif num_states == 3:
-                labels = ["Low", "Medium", "High"]
-            else:
-                labels = [f"State {i+1}" for i in range(num_states)]
-        elif label_strategy == "Numeric value ranges":
-            labels = []
-            for i in range(num_states):
-                lower = thresholds[i]
-                upper = thresholds[i + 1]
-                labels.append(f"{lower:.3g}–{upper:.3g}")
-        else:  # Percentile ranges
-            labels = []
-            percentiles = np.linspace(0, 100, num_states + 1)
-            for i in range(num_states):
-                lower = thresholds[i]
-                upper = thresholds[i + 1]
-                lower_pct = percentiles[i]
-                upper_pct = percentiles[i + 1]
-                labels.append(f"P{lower_pct:.0f}–P{upper_pct:.0f} ({lower:.3g}–{upper:.3g})")
-
-        state_labels.append(labels)
-
-    return state_labels
-
-
-def _get_simdec_scenario_labels(result) -> List[str]:
-    """Compose scenario descriptions for legend entries."""
-    labels: List[str] = []
-
-    var_names = getattr(result, "var_names", None)
-    states = getattr(result, "states", None)
-    if not var_names or not states:
-        return labels
-
-    state_values = _format_state_labels(result)
-    if not state_values:
-        state_values = [
-            ["low", "high"] if (isinstance(state, int) and state == 2) else
-            ["low", "medium", "high"] if (isinstance(state, int) and state == 3) else
-            [f"state {i+1}" for i in range(state if isinstance(state, int) else 1)]
-            for state in states
-        ]
-
-    for combination in itertools.product(*state_values):
-        parts = [f"{var}: {state}" for var, state in zip(var_names, combination)]
-        labels.append(" | ".join(parts))
-
-    return labels
-
-
-def _add_simdec_legend(result, fig) -> None:
-    """Append a descriptive legend beneath the supplied Matplotlib figure."""
-    matplotlib_fig = _extract_matplotlib_figure(fig)
-    if matplotlib_fig is None or not matplotlib_fig.axes:
-        return
-
-    palette = _get_simdec_palette(result.states, getattr(result, "palette_name", "SimDec native (default)"))
-    if palette is None:
-        try:
-            from simdec import palette as _simdec_palette  # type: ignore
-            palette = np.asarray(_simdec_palette(result.states)).tolist()
-        except Exception:
-            palette = [(*color, 1.0) for color in sns.color_palette("deep", len(result.states))]
-    if not palette:
-        return
-
-    scenario_labels = _get_simdec_scenario_labels(result)
-    if not scenario_labels:
-        scenario_labels = [f"Scenario {idx + 1}" for idx in range(len(palette))]
-
-    ax = matplotlib_fig.axes[0]
-    handles, labels = ax.get_legend_handles_labels()
-    existing_labels = set(labels)
-
-    legend_handles = []
-    for idx, color in enumerate(palette):
-        label = scenario_labels[idx] if idx < len(scenario_labels) else f"Scenario {idx + 1}"
-        if label in existing_labels:
-            continue
-        try:
-            patch = Patch(facecolor=color, edgecolor="black", label=label)
-        except Exception:
-            continue
-        legend_handles.append(patch)
-
-    if not legend_handles:
-        return
-
-    handles.extend(legend_handles)
-    labels.extend([h.get_label() for h in legend_handles])
-    ax.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.25),
-        ncol=2,
-        fontsize="small",
-        frameon=False,
-    )
-    matplotlib_fig.subplots_adjust(bottom=0.3)
-
-
-def _style_simdec_plot(fig) -> None:
-    """Apply consistent typography and line widths to SimDec figures."""
-    matplotlib_fig = _extract_matplotlib_figure(fig)
-    if matplotlib_fig is None:
-        return
-
-    for ax in matplotlib_fig.axes:
-        ax.tick_params(labelsize=9)
-        if ax.title:
-            ax.title.set_fontsize(11)
-        ax.set_xlabel(ax.get_xlabel(), fontsize=10)
-        ax.set_ylabel(ax.get_ylabel(), fontsize=10)
-
-        for patch in ax.patches:
-            try:
-                patch.set_linewidth(0.6)
-            except Exception:
-                continue
-        for line in ax.lines:
-            try:
-                current = line.get_linewidth() or 1.0
-                line.set_linewidth(max(current * 0.8, 0.6))
-            except Exception:
-                continue
-        for spine in ax.spines.values():
-            spine.set_linewidth(0.6)
-
-
-def _apply_palette_to_figure(fig, palette: List[List[float]]) -> None:
-    matplotlib_fig = _extract_matplotlib_figure(fig)
-    if matplotlib_fig is None:
-        return
-
-    for ax in matplotlib_fig.axes:
-        palette_cycle = itertools.cycle(palette)
-        for patch in ax.patches:
-            color = next(palette_cycle)
-            try:
-                patch.set_facecolor(color)
-                patch.set_edgecolor(color)
-                patch.set_alpha(color[3] if len(color) == 4 else 1.0)
-            except Exception:
-                continue
-        if hasattr(ax, "artists"):
-            palette_cycle = itertools.cycle(palette)
-            for artist in getattr(ax, "artists", []):
-                color = next(palette_cycle)
-                try:
-                    artist.set_facecolor(color)
-                    artist.set_edgecolor("black")
-                    artist.set_alpha(color[3] if len(color) == 4 else 1.0)
-                    artist.set_sizes([36])
-                except Exception:
-                    continue
-
-
-def _running_in_streamlit() -> bool:
-    """Check whether the script is executed inside a Streamlit runtime."""
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-
-        return get_script_run_ctx() is not None
-    except Exception:
-        return False
-
-
-def run_simulation(n: int = 10_000, seed: Optional[int] = None) -> pd.DataFrame:
-    """Run the default ProbCalc simulation for the core variables A, B, and C."""
-    rng = np.random.default_rng(seed)
-    a = rng.uniform(2.0, 20.0, n)
-    b = rng.uniform(2.0, 20.0, n)
-    c = 40.0 * rng.beta(2.0, 5.0, n)
-    result = a * (b + c)
-    return pd.DataFrame({"A": a, "B": b, "C": c, "result": result})
-
 # Safe constants available in expressions
 SAFE_CONST = {"pi": np.pi, "e": np.e, "inf": np.inf, "nan": np.nan}
 
@@ -474,11 +48,9 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
-st.set_page_config(page_title=f"ProbCalcMC {APP_VERSION}", layout="wide")
-st.title(f"ProbCalcMC {APP_VERSION} – Custom Monte Carlo simulation")
+st.set_page_config(page_title="ProbCalcMC", layout="wide")
+st.title("ProbCalcMC – Custom Monte Carlo simulation")
 st.markdown("<div style='margin-top:-0.5rem; font-size:0.9rem; color:#666'><em>by Lars Hjelm</em></div>", unsafe_allow_html=True)
-# Show version badge
-st.caption(f"Version {APP_VERSION}")
 # Enlarge primary buttons slightly
 st.markdown("""
 <style>
@@ -530,7 +102,7 @@ DISTROS = {
     "Poisson": {"params": [("lam", 5.0, float)]},
     "Exponential": {"params": [("rate (1/scale)", 1.0, float)]},
     "Gamma": {"params": [("shape", 2.0, float), ("scale", 2.0, float)]},
-    "Beta": {"params": [("alpha", 2.0, float), ("beta", 2.0, float), ("max", 1.0, float)]},
+    "Beta": {"params": [("alpha", 2.0, float), ("beta", 2.0, float)]},
     "Weibull": {"params": [("shape (k)", 1.5, float), ("scale (lambda)", 5.0, float)]},
     "Geometric": {"params": [("p", 0.5, float)]},
     "Pareto": {"params": [("shape (a)", 3.0, float), ("scale (xm)", 1.0, float)]},
@@ -715,13 +287,7 @@ def sample_distribution(kind: str, params: Dict[str, Any], n: int) -> np.ndarray
         a, b = float(params["alpha"]), float(params["beta"]) 
         if a <= 0 or b <= 0:
             raise ValueError("Beta: alpha and beta must be > 0.")
-        draws = np.random.beta(a, b, size=n)
-        if "max" in params:
-            max_val = float(params["max"])
-            if max_val <= 0:
-                raise ValueError("Beta: max must be > 0.")
-            return draws * max_val
-        return draws
+        return np.random.beta(a, b, size=n)
     elif kind == "Weibull":
         k, lam = float(params["shape (k)"]), float(params["scale (lambda)"]) 
         if k <= 0 or lam <= 0:
@@ -829,31 +395,6 @@ def sample_distribution(kind: str, params: Dict[str, Any], n: int) -> np.ndarray
 max_vars = 256
 num_vars = st.sidebar.number_input("How many variables?", 1, max_vars, 3, step=1)
 var_symbols = make_symbols(int(num_vars))
-
-if "initialized_defaults_v0_8" not in st.session_state:
-    default_session_values = {
-        "name_a": "K",
-        "name_b": "μ",
-        "name_c": "ρ",
-        "dtype_a": "Triangular",
-        "dtype_b": "Normal",
-        "dtype_c": "PERT",
-        "a_low": 30e9,
-        "a_mode": 35e9,
-        "a_high": 40e9,
-        "b_mean": 30e9,
-        "b_sd": 3e9,
-        "c_min": 2550.0,
-        "c_most_likely": 2650.0,
-        "c_max": 2800.0,
-        "prob_a": 1.0,
-        "prob_b": 1.0,
-        "prob_c": 1.0,
-    }
-    for key, value in default_session_values.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-    st.session_state["initialized_defaults_v0_8"] = True
 
 variables_config: Dict[str, Dict[str, Any]] = {}
 
@@ -1273,12 +814,8 @@ with st.expander("Available Variables", expanded=False):
 # Manage multiple result formulas
 if "formulas" not in st.session_state:
     st.session_state.formulas = [
-        {"name": "V_p", "expr": "sqrt((a + (4/3)*b) / c)"}
+        {"name": "result", "expr": "a + b + c"}
     ]
-if "results_cache" not in st.session_state:
-    st.session_state.results_cache = {}
-if "results_uncond_cache" not in st.session_state:
-    st.session_state.results_uncond_cache = {}
 
 cols = st.columns([2,1,1])
 with cols[0]:
@@ -1351,7 +888,7 @@ with cols[0]:
                             depth = 1
                             j = i0
                             while j < len(t) and depth > 0:
-                                if t[j] == '(': 
+                                if t[j] == '(':
                                     depth += 1
                                 elif t[j] == ')':
                                     depth -= 1
@@ -1386,7 +923,7 @@ with cols[0]:
                     return t
                 s = top_level_frac(s)
                 
-                # Also convert a/b inside \\sqrt{ ... } to \\frac{a}{b}
+                # Also convert a/b inside \sqrt{ ... } to \frac{a}{b}
                 def convert_frac_inside_sqrt(t: str) -> str:
                     out = []
                     i = 0
@@ -1415,7 +952,7 @@ with cols[0]:
             
             latex_expr = to_latex(display_expr)
             
-            # Left-hand side result name, support subscripts, no \\mathrm
+            # Left-hand side result name, support subscripts, no \mathrm
             name_raw = f["name"]
             if any(ch in name_raw for ch in ['\\', '{', '}']):
                 lhs_tex = name_raw  # assume user provided LaTeX
@@ -1489,12 +1026,10 @@ def evaluate_expression(expr: str, env: Dict[str, np.ndarray]) -> np.ndarray:
         else:
             raise ValueError(f"Error evaluating expression '{expr}': {e}")
 
-results: Dict[str, np.ndarray] = st.session_state.results_cache
-results_unconditional: Dict[str, np.ndarray] = st.session_state.results_uncond_cache
+results: Dict[str, np.ndarray] = {}
+results_unconditional: Dict[str, np.ndarray] = {}
 
 if compute_now and st.session_state.formulas:
-    results = {}
-    results_unconditional = {}
     with st.spinner("Computing results..."):
         errors = []
 
@@ -1550,294 +1085,113 @@ if compute_now and st.session_state.formulas:
             st.warning("No results to display. Please fix the errors above.")
 
     if results:
-        st.session_state.results_cache = results
-        st.session_state.results_uncond_cache = results_unconditional
+        # Show derived-variable mapping for clarity
+        with st.expander("Derived variables from formulas", expanded=False):
+            st.markdown("You can reference earlier results in later formulas:")
+            for i, f in enumerate(st.session_state.formulas, start=1):
+                nm = (f["name"].strip() or "result")
+                slug = _slugify(nm)
+                st.code(f"Formula {i}:  {nm}  →  f{i}  and  res_{slug}", language="text")
 
+        # Check if any variable has occurrence probability
+        has_occurrence = any(variables_config[sym].get("prob", 1.0) < 1.0 for sym in variables_config.keys())
+        
+        # Summary table - show conditional and unconditional
+        def summarize(x: np.ndarray, prefix: str = "") -> Dict[str, float]:
+            mode_val = float(approx_mode(x))
+            # Calculate skewness and kurtosis if SciPy available
+            skew_val = float(stats.skew(x, bias=False)) if SCIPY_AVAILABLE else float("nan")
+            kurtosis_val = float(stats.kurtosis(x, fisher=False, bias=False)) if SCIPY_AVAILABLE else float("nan")
+            p10, p90 = p_lo_hi(x)
+            
+            stats_dict = {
+                "mean": float(np.mean(x)),
+                "sd": float(np.std(x, ddof=1)),
+                "mode": mode_val,
+                "skew": skew_val,
+                "kurtosis": kurtosis_val,
+                "p10": float(p10),
+                "p50": float(np.percentile(x, 50)),
+                "p90": float(p90),
+                "p5": float(np.percentile(x, 95)),
+                "p95": float(np.percentile(x, 5)),
+                "min": float(np.min(x)),
+                "max": float(np.max(x)),
+            }
+            
+            if prefix:
+                return {f"{k}_{prefix}": v for k, v in stats_dict.items()}
+            return stats_dict
+        
+        # --- Show input variables summary table (before results table) ---
+        order_cols = ["mean", "mode", "min", "p90", "p50", "p10", "max", "sd", "skew", "kurtosis"]
+        var_summary_rows = []
+        for sym in samples.keys():
+            v_cond = samples[sym]
+            v_uncond = unconditional_samples[sym]
+            var_name = variables_config.get(sym, {}).get("name", sym)
+            label_base = f"{var_name} ({sym})"
+            if has_occurrence:
+                var_summary_rows.append({"variable": f"{label_base} (conditional)", **summarize(v_cond)})
+                var_summary_rows.append({"variable": f"{label_base} (unconditional)", **summarize(v_uncond)})
+            else:
+                var_summary_rows.append({"variable": label_base, **summarize(v_cond)})
+        if var_summary_rows:
+            var_summary_df = pd.DataFrame(var_summary_rows)
+            # Reorder and drop p5/p95
+            present = [c for c in order_cols if c in var_summary_df.columns]
+            var_summary_df = var_summary_df[["variable"] + present]
+            st.subheader("Input Variables — Distribution Summary")
+            st.dataframe(var_summary_df, use_container_width=True)
+        
 
-def _render_results_section(
-    results: Dict[str, np.ndarray],
-    results_unconditional: Dict[str, np.ndarray],
-) -> None:
-    if not results:
-        return
+        summary_rows = []
+        for k, v_cond in results.items():
+            v_uncond = results_unconditional[k]
+            
+            if has_occurrence:
+                # Show two rows: one for conditional, one for unconditional
+                row_cond = {"result": f"{k} (conditional)", **summarize(v_cond)}
+                row_uncond = {"result": f"{k} (unconditional)", **summarize(v_uncond)}
+                summary_rows.append(row_cond)
+                summary_rows.append(row_uncond)
+            else:
+                # Only show one row
+                row = {"result": k, **summarize(v_cond)}
+                summary_rows.append(row)
+        
+        summary_df = pd.DataFrame(summary_rows)
+        # Reorder and drop p5/p95
+        present_res = [c for c in order_cols if c in summary_df.columns]
+        summary_df = summary_df[["result"] + present_res]
+        st.dataframe(summary_df, use_container_width=True)
 
-    # Show derived-variable mapping for clarity
-    with st.expander("Derived variables from formulas", expanded=False):
-        st.markdown("You can reference earlier results in later formulas:")
-        for i, f in enumerate(st.session_state.formulas, start=1):
-            nm = (f["name"].strip() or "result")
-            slug = _slugify(nm)
-            st.code(f"Formula {i}:  {nm}  →  f{i}  and  res_{slug}", language="text")
-
-    # Check if any variable has occurrence probability
-    has_occurrence = any(
-        variables_config[sym].get("prob", 1.0) < 1.0 for sym in variables_config.keys()
-    )
-
-    def summarize(x: np.ndarray, prefix: str = "") -> Dict[str, float]:
-        mode_val = float(approx_mode(x))
-        skew_val = float(stats.skew(x, bias=False)) if SCIPY_AVAILABLE else float("nan")
-        kurtosis_val = float(stats.kurtosis(x, fisher=False, bias=False)) if SCIPY_AVAILABLE else float("nan")
-        p10, p90 = p_lo_hi(x)
-
-        stats_dict = {
-            "mean": float(np.mean(x)),
-            "sd": float(np.std(x, ddof=1)),
-            "mode": mode_val,
-            "skew": skew_val,
-            "kurtosis": kurtosis_val,
-            "p10": float(p10),
-            "p50": float(np.percentile(x, 50)),
-            "p90": float(p90),
-            "p5": float(np.percentile(x, 95)),
-            "p95": float(np.percentile(x, 5)),
-            "min": float(np.min(x)),
-            "max": float(np.max(x)),
-        }
-
-        if prefix:
-            return {f"{k}_{prefix}": v for k, v in stats_dict.items()}
-        return stats_dict
-
-    # --- Show input variables summary table (before results table) ---
-    order_cols = ["mean", "mode", "min", "p90", "p50", "p10", "max", "sd", "skew", "kurtosis"]
-    var_summary_rows = []
-    for sym in samples.keys():
-        v_cond = samples[sym]
-        v_uncond = unconditional_samples[sym]
-        var_name = variables_config.get(sym, {}).get("name", sym)
-        label_base = f"{var_name} ({sym})"
-        if has_occurrence:
-            var_summary_rows.append({"variable": f"{label_base} (conditional)", **summarize(v_cond)})
-            var_summary_rows.append({"variable": f"{label_base} (unconditional)", **summarize(v_uncond)})
-        else:
-            var_summary_rows.append({"variable": label_base, **summarize(v_cond)})
-    if var_summary_rows:
-        var_summary_df = pd.DataFrame(var_summary_rows)
-        present = [c for c in order_cols if c in var_summary_df.columns]
-        var_summary_df = var_summary_df[["variable"] + present]
-        st.subheader("Input Variables — Distribution Summary")
-        st.dataframe(var_summary_df, use_container_width=True)
-
-    summary_rows = []
-    for k, v_cond in results.items():
-        v_uncond = results_unconditional.get(k, v_cond)
-
-        if has_occurrence:
-            row_cond = {"result": f"{k} (conditional)", **summarize(v_cond)}
-            row_uncond = {"result": f"{k} (unconditional)", **summarize(v_uncond)}
-            summary_rows.append(row_cond)
-            summary_rows.append(row_uncond)
-        else:
-            summary_rows.append({"result": k, **summarize(v_cond)})
-
-    summary_df = pd.DataFrame(summary_rows)
-    present_res = [c for c in order_cols if c in summary_df.columns]
-    summary_df = summary_df[["result"] + present_res]
-    st.dataframe(summary_df, use_container_width=True)
-
-    def create_plot(values, title, color=PALETTE[0], show_legend=True):
-        """Create histogram + CDF plot for a single distribution"""
-        fig = go.Figure()
-
-        mean_val = float(np.mean(values))
-        p10 = float(np.percentile(values, 90))  # High value
-        p50 = float(np.percentile(values, 50))
-        p90 = float(np.percentile(values, 10))  # Low value
-
-        fig.add_histogram(
-            x=values,
-            nbinsx=100,
-            name=title,
-            marker_color=color,
-            opacity=0.85,
-            histnorm='probability density',
-            hovertemplate="%{x:.4g}",
-            showlegend=show_legend
-        )
-
-        fig.update_layout(
-            xaxis_title=f"{title}",
-            yaxis_title="Probability Density",
-            margin=dict(l=40, r=50, t=40, b=60),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
-            height=450,
-            hovermode='x unified',
-            barmode='overlay',
-            bargap=0.02,
-            yaxis2=dict(
-                overlaying="y",
-                side="right",
-                range=[0, 1],
-                showgrid=False,
-                title="Probability of Exceedance"
-            )
-        )
-
-        sorted_v = np.sort(values)
-        cdf_vals = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
-        cdf_vals = 1 - cdf_vals  # Exceedance
-
-        fig.add_trace(go.Scatter(
-            x=sorted_v,
-            y=cdf_vals,
-            mode='lines',
-            name=f"CDF {title}",
-            line=dict(color=PALETTE[2], width=3),
-            opacity=1.0,
-            yaxis="y2",
-            hovertemplate="Value: %{x:.4g}<br>Probability of Exceedance: %{y:.1%}<extra></extra>",
-            showlegend=show_legend
-        ))
-
-        def cdf_at(val):
-            idx = np.searchsorted(sorted_v, val, side='left')
-            return 1 - (idx / len(sorted_v))
-        for val, label, mcolor in [(p10, "P10", "red"), (p50, "P50", "orange"), (mean_val, "Mean", "green"), (p90, "P90", "blue")]:
-            fig.add_trace(go.Scatter(
-                x=[val],
-                y=[cdf_at(val)],
-                mode='markers+text',
-                name=label,
-                text=[label],
-                textposition="top center",
-                marker=dict(size=10, color=mcolor),
-                yaxis="y2",
-                hovertemplate="Value: %{x:.4g}<br>Exceedance: %{y:.1%}<extra></extra>",
-                showlegend=False
-            ))
-        return fig
-
-    for k in results.keys():
-        st.markdown(f"#### {k} — Distribution Plots")
-        v_cond = results[k]
-        v_uncond = results_unconditional.get(k, v_cond)
-
-        if has_occurrence:
-            col1, col2 = st.columns(2)
-
-            with col1:
-                fig_cond = create_plot(v_cond, f"{k} (Conditional)", color=PALETTE[0])
-                st.plotly_chart(fig_cond, use_container_width=True)
-
-            with col2:
-                fig_uncond = create_plot(v_uncond, f"{k} (Unconditional)", color=PALETTE[1])
-                st.plotly_chart(fig_uncond, use_container_width=True)
-
-            fig_combined = go.Figure()
-
-            fig_combined.add_histogram(
-                x=v_cond,
+        # Helper function to create a single plot
+        def create_plot(values, title, color=PALETTE[0], show_legend=True):
+            """Create histogram + CDF plot for a single distribution"""
+            fig = go.Figure()
+            
+            # Calculate statistics with inverted percentiles
+            mean_val = float(np.mean(values))
+            p10 = float(np.percentile(values, 90))  # High value
+            p50 = float(np.percentile(values, 50))
+            p90 = float(np.percentile(values, 10))  # Low value
+            
+            # Add histogram
+            fig.add_histogram(
+                x=values,
                 nbinsx=100,
-                name="Conditional Histogram",
-                marker_color=PALETTE[0],
-                opacity=0.6,
+                name=title,
+                marker_color=color,
+                opacity=0.85,
                 histnorm='probability density',
-                hovertemplate="%{x:.4g}"
+                hovertemplate="%{x:.4g}",
+                showlegend=show_legend
             )
-            fig_combined.add_histogram(
-                x=v_uncond,
-                nbinsx=100,
-                name="Unconditional Histogram",
-                marker_color=PALETTE[1],
-                opacity=0.4,
-                histnorm='probability density',
-                hovertemplate="%{x:.4g}"
-            )
-
-            mean_cond = float(np.mean(v_cond))
-            p10_cond = float(np.percentile(v_cond, 90))
-            p50_cond = float(np.percentile(v_cond, 50))
-            p90_cond = float(np.percentile(v_cond, 10))
-
-            mean_uncond = float(np.mean(v_uncond))
-            p10_uncond = float(np.percentile(v_uncond, 90))
-            p50_uncond = float(np.percentile(v_uncond, 50))
-            p90_uncond = float(np.percentile(v_uncond, 10))
-
-            for val, label, line_color in [(p10_cond, "P10", "red"), (p50_cond, "P50", "orange"), (mean_cond, "Mean", "green"), (p90_cond, "P90", "blue")]:
-                fig_combined.add_vline(
-                    x=val,
-                    line_width=2,
-                    line_dash="dash",
-                    line_color=line_color,
-                    opacity=0.75
-                )
-
-            for val, label, line_color in [(p10_uncond, "P10", "red"), (p50_uncond, "P50", "orange"), (mean_uncond, "Mean", "green"), (p90_uncond, "P90", "blue")]:
-                fig_combined.add_vline(
-                    x=val,
-                    line_width=1.5,
-                    line_dash="dot",
-                    line_color=line_color,
-                    opacity=0.4
-                )
-
-            sorted_cond = np.sort(v_cond)
-            sorted_uncond = np.sort(v_uncond)
-            cdf_cond_at_or_below = np.arange(1, len(sorted_cond) + 1) / len(sorted_cond)
-            cdf_cond = 1 - cdf_cond_at_or_below
-            cdf_uncond_at_or_below = np.arange(1, len(sorted_uncond) + 1) / len(sorted_uncond)
-            cdf_uncond = 1 - cdf_uncond_at_or_below
-
-            fig_combined.add_trace(go.Scatter(
-                x=sorted_cond,
-                y=cdf_cond,
-                mode='lines',
-                name="Conditional CDF",
-                line=dict(color=PALETTE[1], width=3, dash='dash'),
-                opacity=1.0,
-                yaxis="y2",
-                hovertemplate="Value: %{x:.4g}<br>Probability of Exceedance: %{y:.1%}<extra></extra>"
-            ))
-
-            fig_combined.add_trace(go.Scatter(
-                x=sorted_uncond,
-                y=cdf_uncond,
-                mode='lines',
-                name="Unconditional CDF",
-                line=dict(color=PALETTE[2], width=3, dash='solid'),
-                opacity=1.0,
-                yaxis="y2",
-                hovertemplate="Value: %{x:.4g}<br>Probability of Exceedance: %{y:.1%}<extra></extra>"
-            ))
-
-            for val_cond, val_uncond, label, line_color in [
-                (p10_cond, p10_uncond, "P10", "red"),
-                (p50_cond, p50_uncond, "P50", "orange"),
-                (mean_cond, mean_uncond, "Mean", "green"),
-                (p90_cond, p90_uncond, "P90", "blue"),
-            ]:
-                cdf_val_cond_at_or_below = np.searchsorted(sorted_cond, val_cond, side='left') / len(sorted_cond)
-                cdf_val_cond = 1 - cdf_val_cond_at_or_below
-                cdf_val_uncond_at_or_below = np.searchsorted(sorted_uncond, val_uncond, side='left') / len(sorted_uncond)
-                cdf_val_uncond = 1 - cdf_val_uncond_at_or_below
-
-                fig_combined.add_trace(go.Scatter(
-                    x=[val_cond],
-                    y=[cdf_val_cond],
-                    mode='markers+text',
-                    name=f"{label} (cond)",
-                    marker=dict(size=12, color=line_color),
-                    text=[label],
-                    textposition="top center",
-                    yaxis="y2",
-                    hovertemplate=f'{label} (cond)<br>Value: {val_cond:.4g}<br>Probability of Exceedance: {cdf_val_cond:.1%}<extra></extra>',
-                    showlegend=False
-                ))
-                fig_combined.add_trace(go.Scatter(
-                    x=[val_uncond],
-                    y=[cdf_val_uncond],
-                    mode='markers',
-                    name=f"{label} (uncond)",
-                    marker=dict(size=8, color=line_color, opacity=0.5, symbol='circle-open'),
-                    yaxis="y2",
-                    hovertemplate=f'{label} (uncond)<br>Value: {val_uncond:.4g}<br>Probability of Exceedance: {cdf_val_uncond:.1%}<extra></extra>',
-                    showlegend=False
-                ))
-
-            fig_combined.update_layout(
-                xaxis_title=f"{k}",
+            
+            # Update layout with secondary y-axis for CDF
+            fig.update_layout(
+                xaxis_title=f"{title}",
                 yaxis_title="Probability Density",
                 margin=dict(l=40, r=50, t=40, b=60),
                 legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
@@ -1853,135 +1207,326 @@ def _render_results_section(
                     title="Probability of Exceedance"
                 )
             )
-
-            st.markdown("**Combined View**")
-            st.plotly_chart(fig_combined, use_container_width=True)
-
-        else:
-            fig = create_plot(v_cond, k, color=PALETTE[0])
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Simulation Decomposition (SimDec)")
-    if not SIMDEC_AVAILABLE:
-        st.info("SimDec analysis requires the `simdec` package. Install via `pip install simdec`.")
-    else:
-        st.caption(
-            "SimDec partitions each input variable into equally probable states (ordered from low to high values) and compares their impact on the selected result. "
-            "Note that a \"low\" state corresponds to the lower percentile (high probability of exceedance), while a \"high\" state corresponds to the upper percentile (low probability of exceedance)."
-        )
-        show_simdec = st.checkbox("Show SimDec Analysis", value=False)
-        if show_simdec:
-            label_strategy = st.selectbox(
-                "State label style",
-                (
-                    "Percentile ranges",
-                    "Low / Medium / High",
-                    "Numeric value ranges",
-                ),
-                help="Select how the scenario labels should be named in the plots.",
-            )
-            palette_choice = st.selectbox(
-                "Color palette",
-                SIMDEC_QUALITATIVE_CMAPS,
-                index=0,
-                help="Choose a qualitative matplotlib/seaborn palette for SimDec scenarios.",
-            )
-            for result_name, result_values in results.items():
-                st.markdown(f"### {result_name}")
-                simdec_columns: Dict[str, Any] = {}
-                seen_names: Dict[str, int] = {}
-
-                for sym, values in samples.items():
-                    base_name = variables_config.get(sym, {}).get("name", sym) or sym
-                    col_name = base_name
-                    if col_name in seen_names:
-                        seen_names[col_name] += 1
-                        col_name = f"{base_name} ({seen_names[col_name]})"
-                    else:
-                        seen_names[col_name] = 1
-                    simdec_columns[col_name] = values
-
-                result_column = result_name
-                if result_column in simdec_columns:
-                    suffix = 1
-                    while f"{result_column} ({suffix})" in simdec_columns:
-                        suffix += 1
-                    result_column = f"{result_name} ({suffix})"
-                simdec_columns[result_column] = result_values
-
-                simdec_df = pd.DataFrame(simdec_columns)
-                if simdec_df.empty or result_column not in simdec_df.columns:
-                    st.warning(
-                        f"SimDec requires the calculated result '{result_name}' and at least one input variable."
-                    )
-                    continue
-
-                input_cols = [col for col in simdec_df.columns if col != result_column]
-                if not input_cols:
-                    st.warning(
-                        f"No input variables available for SimDec analysis of '{result_name}'."
-                    )
-                    continue
-
-                state_choice = st.selectbox(
-                    f"States per input for {result_name}",
-                    (
-                        "Automatic (SimDec default)",
-                        "Two states (low/high)",
-                        "Three states (low/medium/high)",
-                    ),
-                    help=(
-                        "Choose how many equally probable bins each variable is split into before the decomposition."
-                    ),
-                    key=f"states_choice_{result_name}"
+            
+            # Calculate CDF
+            sorted_v = np.sort(values)
+            cdf_vals = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
+            cdf_vals = 1 - cdf_vals  # Exceedance
+            
+            # Add CDF
+            fig.add_trace(go.Scatter(
+                x=sorted_v,
+                y=cdf_vals,
+                mode='lines',
+                name=f"CDF {title}",
+                line=dict(color=PALETTE[2], width=3),
+                opacity=1.0,
+                yaxis="y2",
+                hovertemplate="Value: %{x:.4g}<br>Probability of Exceedance: %{y:.1%}<extra></extra>",
+                showlegend=show_legend
+            ))
+            
+            # Add markers at P10, P50, Mean, P90 on CDF
+            def cdf_at(val):
+                # Exceedance probability at value
+                idx = np.searchsorted(sorted_v, val, side='left')
+                return 1 - (idx / len(sorted_v))
+            for val, label, mcolor in [(p10, "P10", "red"), (p50, "P50", "orange"), (mean_val, "Mean", "green"), (p90, "P90", "blue")]:
+                fig.add_trace(go.Scatter(
+                    x=[val],
+                    y=[cdf_at(val)],
+                    mode='markers+text',
+                    name=label,
+                    text=[label],
+                    textposition="top center",
+                    marker=dict(size=10, color=mcolor),
+                    yaxis="y2",
+                    hovertemplate="Value: %{x:.4g}<br>Exceedance: %{y:.1%}<extra></extra>",
+                    showlegend=False
+                ))
+            return fig
+        
+        # Plots - Interactive Plotly with histogram and CDF overlaid
+        for k in results.keys():
+            v_cond = results[k]
+            v_uncond = results_unconditional[k]
+            
+            # Check if any variable has occurrence probability
+            has_occurrence = any(variables_config[sym].get("prob", 1.0) < 1.0 for sym in variables_config.keys())
+            
+            if has_occurrence:
+                # Show three plots: conditional, unconditional, combined
+                st.markdown(f"#### {k} - Distribution Plots")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Conditional plot
+                    fig_cond = create_plot(v_cond, f"{k} (Conditional)", color=PALETTE[0])
+                    st.plotly_chart(fig_cond, use_container_width=True)
+                
+                with col2:
+                    # Unconditional plot
+                    fig_uncond = create_plot(v_uncond, f"{k} (Unconditional)", color=PALETTE[1])
+                    st.plotly_chart(fig_uncond, use_container_width=True)
+                
+                # Combined plot
+                fig_combined = go.Figure()
+                
+                # Add both histograms
+                fig_combined.add_histogram(
+                    x=v_cond,
+                    nbinsx=100,
+                    name="Conditional Histogram",
+                    marker_color=PALETTE[0],
+                    opacity=0.6,
+                    histnorm='probability density',
+                    hovertemplate="%{x:.4g}"
                 )
-                states_override: Optional[List[int]] = None
-                if state_choice.startswith("Two"):
-                    states_override = [2] * len(input_cols)
-                elif state_choice.startswith("Three"):
-                    states_override = [3] * len(input_cols)
-
-                try:
-                    decomposition_result = decompose(
-                        simdec_df,
-                        inputs=input_cols,
-                        output=result_column,
-                        bins=10,
-                        states=states_override,
+                fig_combined.add_histogram(
+                    x=v_uncond,
+                    nbinsx=100,
+                    name="Unconditional Histogram",
+                    marker_color=PALETTE[1],
+                    opacity=0.4,
+                    histnorm='probability density',
+                    hovertemplate="%{x:.4g}"
+                )
+                
+                # Calculate stats for both
+                mean_cond = float(np.mean(v_cond))
+                p10_cond = float(np.percentile(v_cond, 90))
+                p50_cond = float(np.percentile(v_cond, 50))
+                p90_cond = float(np.percentile(v_cond, 10))
+                
+                mean_uncond = float(np.mean(v_uncond))
+                p10_uncond = float(np.percentile(v_uncond, 90))
+                p50_uncond = float(np.percentile(v_uncond, 50))
+                p90_uncond = float(np.percentile(v_uncond, 10))
+                
+                # Add conditional vertical lines
+                for val, label, line_color in [(p10_cond, "P10", "red"), (p50_cond, "P50", "orange"), (mean_cond, "Mean", "green"), (p90_cond, "P90", "blue")]:
+                    fig_combined.add_vline(
+                        x=val,
+                        line_width=2,
+                        line_dash="dash",
+                        line_color=line_color,
+                        opacity=0.75
                     )
-                    decomposition_result.label_strategy = label_strategy  # type: ignore[attr-defined]
-                    decomposition_result.palette_name = palette_choice  # type: ignore[attr-defined]
-                except Exception as exc:
-                    st.error(f"SimDec decomposition failed for {result_name}: {type(exc).__name__}: {exc}")
-                else:
-                    st.markdown("**Decomposition Bins**")
-                    fig_bins = plot_bins(decomposition_result)
-                    palette_colors = _get_simdec_palette(
-                        decomposition_result.states, palette_choice
+                
+                # Add unconditional vertical lines (lighter)
+                for val, label, line_color in [(p10_uncond, "P10", "red"), (p50_uncond, "P50", "orange"), (mean_uncond, "Mean", "green"), (p90_uncond, "P90", "blue")]:
+                    fig_combined.add_vline(
+                        x=val,
+                        line_width=1.5,
+                        line_dash="dot",
+                        line_color=line_color,
+                        opacity=0.4
                     )
-                    if palette_colors is not None:
-                        _apply_palette_to_figure(fig_bins, palette_colors)
-                    _style_simdec_plot(fig_bins)
-                    _add_simdec_legend(decomposition_result, fig_bins)
-                    _display_simdec_plot(fig_bins)
-
-                    st.markdown("**Box Plot**")
-                    fig_box = plot_box(decomposition_result)
-                    palette_colors = _get_simdec_palette(
-                        decomposition_result.states, palette_choice
+                
+                # Add both CDFs (probability of exceedance: P(Value > threshold))
+                sorted_cond = np.sort(v_cond)
+                sorted_uncond = np.sort(v_uncond)
+                cdf_cond_at_or_below = np.arange(1, len(sorted_cond) + 1) / len(sorted_cond)
+                cdf_cond = 1 - cdf_cond_at_or_below  # Invert to show probability of EXCEEDANCE
+                cdf_uncond_at_or_below = np.arange(1, len(sorted_uncond) + 1) / len(sorted_uncond)
+                cdf_uncond = 1 - cdf_uncond_at_or_below  # Invert to show probability of EXCEEDANCE
+                
+                fig_combined.add_trace(go.Scatter(
+                    x=sorted_cond,
+                    y=cdf_cond,
+                    mode='lines',
+                    name="Conditional CDF",
+                    line=dict(color=PALETTE[1], width=3, dash='dash'),
+                    opacity=1.0,
+                    yaxis="y2",
+                    hovertemplate="Value: %{x:.4g}<br>Probability of Exceedance: %{y:.1%}<extra></extra>"
+                ))
+                
+                fig_combined.add_trace(go.Scatter(
+                    x=sorted_uncond,
+                    y=cdf_uncond,
+                    mode='lines',
+                    name="Unconditional CDF",
+                    line=dict(color=PALETTE[2], width=3, dash='solid'),
+                    opacity=1.0,
+                    yaxis="y2",
+                    hovertemplate="Value: %{x:.4g}<br>Probability of Exceedance: %{y:.1%}<extra></extra>"
+                ))
+                
+                # Add markers for both
+                for val_cond, val_uncond, label, line_color in [
+                    (p10_cond, p10_uncond, "P10", "red"),
+                    (p50_cond, p50_uncond, "P50", "orange"),
+                    (mean_cond, mean_uncond, "Mean", "green"),
+                    (p90_cond, p90_uncond, "P90", "blue")
+                ]:
+                    cdf_val_cond_at_or_below = np.searchsorted(sorted_cond, val_cond, side='left') / len(sorted_cond)
+                    cdf_val_cond = 1 - cdf_val_cond_at_or_below  # Exceedance probability
+                    cdf_val_uncond_at_or_below = np.searchsorted(sorted_uncond, val_uncond, side='left') / len(sorted_uncond)
+                    cdf_val_uncond = 1 - cdf_val_uncond_at_or_below  # Exceedance probability
+                    
+                    # Conditional marker
+                    fig_combined.add_trace(go.Scatter(
+                        x=[val_cond],
+                        y=[cdf_val_cond],
+                        mode='markers+text',
+                        name=f"{label} (cond)",
+                        marker=dict(size=12, color=line_color),
+                        text=[label],
+                        textposition="top center",
+                        yaxis="y2",
+                        hovertemplate=f'{label} (cond)<br>Value: {val_cond:.4g}<br>Probability of Exceedance: {cdf_val_cond:.1%}<extra></extra>',
+                        showlegend=False
+                    ))
+                    # Unconditional marker
+                    fig_combined.add_trace(go.Scatter(
+                        x=[val_uncond],
+                        y=[cdf_val_uncond],
+                        mode='markers',
+                        name=f"{label} (uncond)",
+                        marker=dict(size=8, color=line_color, opacity=0.5, symbol='circle-open'),
+                        yaxis="y2",
+                        hovertemplate=f'{label} (uncond)<br>Value: {val_uncond:.4g}<br>Probability of Exceedance: {cdf_val_uncond:.1%}<extra></extra>',
+                        showlegend=False
+                    ))
+                
+                fig_combined.update_layout(
+                    xaxis_title=f"{k}",
+                    yaxis_title="Probability Density",
+                    margin=dict(l=40, r=50, t=40, b=60),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+                    height=450,
+                    hovermode='x unified',
+                    barmode='overlay',
+                    bargap=0.02,
+                    yaxis2=dict(
+                        overlaying="y",
+                        side="right",
+                        range=[0, 1],
+                        showgrid=False,
+                        title="Probability of Exceedance"
                     )
-                    if palette_colors is not None:
-                        _apply_palette_to_figure(fig_box, palette_colors)
-                    _style_simdec_plot(fig_box)
-                    _add_simdec_legend(decomposition_result, fig_box)
-                    _display_simdec_plot(fig_box)
+                )
+                
+                st.markdown("**Combined View:**")
+                st.plotly_chart(fig_combined, use_container_width=True)
+                
+            else:
+                # Only show one plot (no occurrence probability)
+                fig = create_plot(v_cond, k, color=PALETTE[0])
+                st.plotly_chart(fig, use_container_width=True)
 
+        # Prepare data for download with trial numbers
+        trial_df = pd.DataFrame({**samples, **results})
+        trial_df.insert(0, 'Trial', range(1, len(trial_df) + 1))
+        
+        # Download buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Download samples as CSV",
+                data=trial_df.to_csv(index=False).encode("utf-8"),
+                file_name="probcalcmc_samples.csv",
+                mime="text/csv"
+            )
+        with col2:
+            if OPENPYXL_AVAILABLE:
+                # Create Excel file with multiple sheets
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # Sheet 1: Trial samples and results
+                    trial_df.to_excel(writer, sheet_name='Trial Samples', index=False)
 
-_render_results_section(
-    st.session_state.results_cache,
-    st.session_state.results_uncond_cache,
-)
+                    # Sheet 1b: Trial samples and results (Unconditional)
+                    trial_df_uncond = pd.DataFrame({**unconditional_samples, **results_unconditional})
+                    trial_df_uncond.insert(0, 'Trial', range(1, len(trial_df_uncond) + 1))
+                    trial_df_uncond.to_excel(writer, sheet_name='Trial Samples (Uncond)', index=False)
+                    
+                    # Sheet 2: Summary statistics (with inverted percentiles)
+                    stats_rows = []
+                    for result_name in results.keys():
+                        arr = results[result_name]
+                        mode_res = approx_mode(arr)
+                        stats_rows.append({
+                            'Result': result_name,
+                            'Mean': float(np.mean(arr)),
+                            'SD': float(np.std(arr, ddof=1)),
+                            'Skew': float(stats.skew(arr, bias=False)) if SCIPY_AVAILABLE else float('nan'),
+                            'Kurtosis': float(stats.kurtosis(arr, fisher=False, bias=False)) if SCIPY_AVAILABLE else float('nan'),
+                            'Mode': float(mode_res),
+                            'P10': float(np.percentile(arr, 90)),
+                            'P50': float(np.percentile(arr, 50)),
+                            'P90': float(np.percentile(arr, 10)),
+                            'P5': float(np.percentile(arr, 95)),
+                            'P95': float(np.percentile(arr, 5)),
+                            'Min': float(np.min(arr)),
+                            'Max': float(np.max(arr))
+                        })
+                    stats_df = pd.DataFrame(stats_rows)
+                    stats_df.to_excel(writer, sheet_name='Summary Statistics', index=False)
+                    
+                    # Sheet 3: Input Statistics (variables)
+                    var_export_rows = []
+                    for sym in samples.keys():
+                        v = samples[sym]
+                        var_export_rows.append({
+                            'Variable': sym,
+                            'Name': variables_config.get(sym, {}).get('name', sym),
+                            'Mean': float(np.mean(v)),
+                            'SD': float(np.std(v, ddof=1)),
+                            'Skew': float(stats.skew(v, bias=False)) if SCIPY_AVAILABLE else float('nan'),
+                            'Kurtosis': float(stats.kurtosis(v, fisher=False, bias=False)) if SCIPY_AVAILABLE else float('nan'),
+                            'Mode': float(approx_mode(v)),
+                            'P10': float(np.percentile(v, 90)),
+                            'P50': float(np.percentile(v, 50)),
+                            'P90': float(np.percentile(v, 10)),
+                            'P5': float(np.percentile(v, 95)),
+                            'P95': float(np.percentile(v, 5)),
+                            'Min': float(np.min(v)),
+                            'Max': float(np.max(v))
+                        })
+                    var_stats_df = pd.DataFrame(var_export_rows)
+                    var_stats_df.to_excel(writer, sheet_name='Input Statistics', index=False)
+                    
+                    # Sheet 4: Variable Map (symbol → name)
+                    var_map_df = pd.DataFrame([
+                        {'Symbol': sym, 'Name': variables_config.get(sym, {}).get('name', sym)}
+                        for sym in variables_config.keys()
+                    ])
+                    var_map_df.to_excel(writer, sheet_name='Variable Map', index=False)
+
+                    # Sheet 5: Derived Map (formulas → alias names)
+                    derived_map_df = pd.DataFrame([
+                        {
+                            'Formula #': i,
+                            'Result Name': (f["name"].strip() or "result"),
+                            'Alias f#': f"f{i}",
+                            'Alias res_<slug>': f"res_{_slugify(f['name'].strip() or 'result')}"
+                        }
+                        for i, f in enumerate(st.session_state.formulas, start=1)
+                    ])
+                    derived_map_df.to_excel(writer, sheet_name='Derived Map', index=False)
+
+                    # Sheet 6: Formulae (traceability)
+                    formula_rows = [
+                        {"#": i, "Result Name": (f["name"].strip() or "result"), "Expression": f["expr"].strip()}
+                        for i, f in enumerate(st.session_state.formulas, start=1)
+                    ]
+                    pd.DataFrame(formula_rows).to_excel(writer, sheet_name='Formulae', index=False)
+                
+                st.download_button(
+                    "Download as Excel",
+                    data=output.getvalue(),
+                    file_name="probcalcmc_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.download_button(
+                    "Download as Excel",
+                    disabled=True,
+                    help="Install openpyxl for Excel export: pip install openpyxl"
+                )
 
 # --- Show underlying variable samples (optional) ---
 st.markdown("---")
@@ -1992,53 +1537,3 @@ with st.expander("Show variable samples (first 10 rows)"):
 
 st.caption("Tip: Use the sidebar to add up to 256 variables. Set occurrence probabilities to model events that only sometimes happen. Build any formula you like with the allowed functions. Interactive plots show histogram and cumulative probability distribution.")
 
-if __name__ == "__main__" and not _running_in_streamlit():
-        default_df = run_simulation(n=10_000, seed=42)
-        print(default_df.describe())
-        if SIMDEC_AVAILABLE:
-            try:
-                decomposition_result = decompose(
-                    default_df,
-                    inputs=[col for col in default_df.columns if col != "result"],
-                    output="result",
-                    bins=10,
-                )
-                decomposition_result.palette_name = "SimDec native (default)"  # type: ignore[attr-defined]
-            except Exception as exc:
-                print(f"SimDec decomposition failed: {type(exc).__name__}: {exc}")
-            else:
-                fig_bins = plot_bins(decomposition_result)
-                bins_path = Path.cwd() / "simdec_histogram.png"
-                bins_fig = _extract_matplotlib_figure(fig_bins)
-                if bins_fig is not None:
-                    palette_colors = _get_simdec_palette(
-                        decomposition_result.states, getattr(decomposition_result, "palette_name", "SimDec native (default)")
-                    )
-                    if palette_colors is not None:
-                        _apply_palette_to_figure(bins_fig, palette_colors)
-                    _style_simdec_plot(bins_fig)
-                    _add_simdec_legend(decomposition_result, bins_fig)
-                    bins_fig.savefig(bins_path, dpi=150)
-                    plt.close(bins_fig)
-                    print(f"SimDec histogram saved to {bins_path}")
-                else:
-                    print("SimDec histogram figure not saved (unexpected format).")
-
-                fig_box = plot_box(decomposition_result)
-                box_path = Path.cwd() / "simdec_boxplot.png"
-                box_fig = _extract_matplotlib_figure(fig_box)
-                if box_fig is not None:
-                    palette_colors = _get_simdec_palette(
-                        decomposition_result.states, getattr(decomposition_result, "palette_name", "SimDec native (default)")
-                    )
-                    if palette_colors is not None:
-                        _apply_palette_to_figure(box_fig, palette_colors)
-                    _style_simdec_plot(box_fig)
-                    _add_simdec_legend(decomposition_result, box_fig)
-                    box_fig.savefig(box_path, dpi=150)
-                    plt.close(box_fig)
-                    print(f"SimDec box plot saved to {box_path}")
-                else:
-                    print("SimDec box plot figure not saved (unexpected format).")
-        else:
-            print("SimDec analysis skipped: simdec package not installed.")
